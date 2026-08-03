@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,14 @@ from services.rendering.output.typst.shared import TYPST_OVERLAY_DIR
 from services.rendering.output.typst.source_builder import build_typst_book_background_source
 from services.rendering.output.typst.source_builder import build_typst_book_overlay_source
 from services.rendering.output.typst.source_builder import build_typst_overlay_source
+
+# Typst compiles can perform network I/O (downloading `@preview/...` packages from
+# packages.typst.org) and a large book can legitimately take minutes to typeset, so the
+# timeout is generous by default. Override with RETAIN_PDF_TYPST_COMPILE_TIMEOUT_SECONDS
+# for environments with slower package mirrors or very large documents.
+TYPST_COMPILE_TIMEOUT_SECONDS = float(
+    os.environ.get("RETAIN_PDF_TYPST_COMPILE_TIMEOUT_SECONDS", "").strip() or 600
+)
 
 
 class TypstCompileError(RuntimeError):
@@ -79,7 +88,51 @@ def _run_typst_compile(
     work_dir: Path | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    proc = subprocess.run(command, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=TYPST_COMPILE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TypstCompileError(
+            phase=phase,
+            stem=stem,
+            typ_path=typ_path,
+            pdf_path=pdf_path,
+            command=command,
+            return_code=-1,
+            stdout=str(exc.stdout or ""),
+            stderr=(
+                f"Typst compile timed out after {TYPST_COMPILE_TIMEOUT_SECONDS:.0f}s. "
+                "This can happen when Typst stalls downloading a @preview package from "
+                "packages.typst.org over a slow or stuck connection."
+            ),
+            work_dir=work_dir,
+            extra={
+                **(extra or {}),
+                "runtime_error_type": type(exc).__name__,
+                "timeout_seconds": TYPST_COMPILE_TIMEOUT_SECONDS,
+            },
+        ) from exc
+    except OSError as exc:
+        raise TypstCompileError(
+            phase=phase,
+            stem=stem,
+            typ_path=typ_path,
+            pdf_path=pdf_path,
+            command=command,
+            return_code=-1,
+            stdout="",
+            stderr=f"Typst runtime failed to start: {type(exc).__name__}: {exc}",
+            work_dir=work_dir,
+            extra={
+                **(extra or {}),
+                "runtime_error_type": type(exc).__name__,
+                "typst_bin": command[0] if command else "",
+            },
+        ) from exc
     if proc.returncode != 0:
         raise TypstCompileError(
             phase=phase,
@@ -187,7 +240,8 @@ def compile_typst_book_overlay_pdf(
     typ_path = work_dir / f"{stem}.typ"
     pdf_path = work_dir / f"{stem}.pdf"
     if prebuilt_source_path is not None and Path(prebuilt_source_path).exists():
-        typ_path.write_text(Path(prebuilt_source_path).read_text(encoding="utf-8"), encoding="utf-8")
+        # Byte-for-byte copy — no need to decode/re-encode a multi-MB source file.
+        shutil.copyfile(prebuilt_source_path, typ_path)
     else:
         typ_path.write_text(
             build_typst_book_overlay_source(

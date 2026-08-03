@@ -11,14 +11,15 @@ from services.document_schema.providers import PROVIDER_MINERU
 from services.document_schema.providers import PROVIDER_MINERU_CONTENT_LIST_V2
 from services.document_schema.providers import PROVIDER_PADDLE
 from services.document_schema.validator import build_validation_report
-from services.document_schema.validator import validate_document_payload
 
 AdapterBuilder = Callable[[dict, str, Path, str], dict]
 Detector = Callable[[dict], bool]
 
 
 def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Stream-read; avoid services.pipeline_shared (circular via package __init__).
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _build_mineru_document(payload: dict, document_id: str, source_json_path: Path, provider_version: str) -> dict:
@@ -105,8 +106,18 @@ def detect_ocr_provider(payload: dict) -> str:
 def detect_ocr_provider_with_report(payload: dict) -> dict:
     attempts: list[dict] = []
     for provider, detector in _ADAPTER_DETECTORS:
-        matched = bool(detector(payload))
-        attempts.append({"provider": provider, "matched": matched})
+        try:
+            matched = bool(detector(payload))
+            attempts.append({"provider": provider, "matched": matched})
+        except Exception as exc:
+            attempts.append(
+                {
+                    "provider": provider,
+                    "matched": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
         if matched:
             return {
                 "matched": True,
@@ -150,9 +161,9 @@ def adapt_payload_to_document_v1_with_report(
     if builder is None:
         raise RuntimeError(f"Unsupported OCR provider adapter: {provider}")
     document = builder(payload, document_id, source_json_path, provider_version)
-    upgraded, defaults_report = apply_document_defaults_with_report(document)
+    # Builder output is freshly constructed and never reused, so defaults may mutate in place.
+    upgraded, defaults_report = apply_document_defaults_with_report(document, in_place=True)
     upgraded = enrich_document_contract_v1(upgraded)
-    validate_document_payload(upgraded)
     report = {
         "source_json_path": str(source_json_path),
         "document_id": document_id,
@@ -173,12 +184,14 @@ def adapt_path_to_document_v1(
     document_id: str,
     provider: str | None = None,
     provider_version: str = "",
+    allow_provider_mismatch: bool = False,
 ) -> dict:
     document, _report = adapt_path_to_document_v1_with_report(
         source_json_path=source_json_path,
         document_id=document_id,
         provider=provider,
         provider_version=provider_version,
+        allow_provider_mismatch=allow_provider_mismatch,
     )
     return document
 
@@ -189,12 +202,29 @@ def adapt_path_to_document_v1_with_report(
     document_id: str,
     provider: str | None = None,
     provider_version: str = "",
+    allow_provider_mismatch: bool = False,
+    payload: dict | None = None,
 ) -> tuple[dict, dict]:
-    payload = _load_json(source_json_path)
+    # Callers that already hold the parsed provider payload can pass it in to
+    # skip re-reading the (potentially very large) JSON from disk.
+    if payload is None:
+        payload = _load_json(source_json_path)
     detection_report = detect_ocr_provider_with_report(payload)
     resolved_provider = provider or str(detection_report.get("provider", "") or "")
     if not resolved_provider:
         raise RuntimeError("Unable to detect OCR provider for non-normalized payload.")
+    detected_provider = str(detection_report.get("provider", "") or "")
+    if (
+        provider
+        and detected_provider
+        and detected_provider != resolved_provider
+        and not allow_provider_mismatch
+    ):
+        raise RuntimeError(
+            "Explicit OCR provider does not match detected provider: "
+            f"provider={resolved_provider} detected={detected_provider}. "
+            "Pass allow_provider_mismatch=True only for a configured raw-provider override."
+        )
     document, report = adapt_payload_to_document_v1_with_report(
         payload=payload,
         provider=resolved_provider,
@@ -202,9 +232,10 @@ def adapt_path_to_document_v1_with_report(
         source_json_path=source_json_path,
         provider_version=provider_version,
     )
-    report["detected_provider"] = str(detection_report.get("provider", "") or resolved_provider)
+    report["detected_provider"] = detected_provider or resolved_provider
     report["detection"] = detection_report
     report["provider_was_explicit"] = bool(provider)
+    report["provider_mismatch_allowed"] = bool(allow_provider_mismatch)
     return document, report
 
 

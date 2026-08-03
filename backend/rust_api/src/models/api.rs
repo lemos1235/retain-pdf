@@ -4,6 +4,15 @@ pub use super::glossary::{
     GlossaryCsvParseInput, GlossaryCsvParseView, GlossaryDetailView, GlossaryListView,
     GlossarySummaryView, GlossaryUpsertInput,
 };
+pub use super::library::{
+    AddCollectionDocumentsInput, AppendMessageInput, AssetRecord, BlockSearchHit,
+    CollectionListView, CollectionMutationResult, CollectionRecord, ConversationDetailView,
+    ConversationListView, ConversationMutationResult, ConversationRecord, CreateCollectionInput,
+    CreateConversationInput, CreateFavoriteInput, DocumentListView, DocumentRecord,
+    FavoriteListView, FavoriteMutationResult, FavoriteRecord, FtsBlockRow, ListConversationsQuery,
+    ListDocumentsQuery, ListFavoritesQuery, MessageRecord, PatchCollectionInput,
+    PatchConversationInput, PatchDocumentInput, PatchFavoriteInput, SearchQuery, SearchResultView,
+};
 pub use super::public_contract::{public_request_payload, PublicResolvedJobSpec};
 pub use super::redaction::{
     redact_json_value, redact_optional_text, redact_text, sensitive_values,
@@ -12,7 +21,8 @@ pub use super::view::{
     build_artifact_links, build_artifact_manifest, build_job_actions,
     build_job_links_with_workflow, summarize_list_invocation, to_absolute_url, upload_to_response,
     ArtifactDisplayItemView, ArtifactDownloadQuery, ArtifactLinksView, BookSummaryView,
-    GlossaryUsageSummaryView, InvocationSummaryView, JobActionsView, JobArtifactManifestView,
+    DocumentDeleteResultView, GlossaryUsageSummaryView, InvocationSummaryView, JobActionsView,
+    JobArtifactManifestView,
     JobContractsView, JobDetailView, JobDiagnosticsView, JobEventListView, JobEventProgressView,
     JobEventRawView, JobEventRecord, JobFailureDiagnosticView, JobLinksView, JobListItemView,
     JobListView, JobProgressView, JobResumePlanView, JobStageContractArtifactView,
@@ -22,10 +32,12 @@ pub use super::view::{
     LibraryBookListView, LibraryDeleteQuery, LibraryDeleteResultView, ListGlossariesQuery,
     ListJobEventsQuery, ListJobsQuery, ListTranslationItemsQuery, MarkdownDocumentView,
     MarkdownImageView, MarkdownQuery, MarkdownView, NormalizationSummaryView, OcrJobSummaryView,
-    PagePreviewQuery, ReaderDocumentMetadataView, ReaderMetadataView, ReaderPageMetadataView,
-    ReaderRegionBoxView, ReaderRegionItemView, ReaderRegionsView, RetryStageKind,
-    RetryStageRequest, RetryStageSubmissionView, StageActionsView, StageRetryActionLinkView,
-    StageRetryActionView, TranslationDebugIndexView, TranslationDebugItemView,
-    TranslationDebugListItemView, TranslationDebugListView, TranslationDiagnosticsView,
-    TranslationReplayView,
+    PagePreviewQuery, ReaderAiChatRequest, ReaderAiChatView, ReaderAiCitationView,
+    ReaderAiContextView, ReaderAiHistoryMessageView, ReaderAiRectView, ReaderAiSelectionView,
+    ReaderAiUsedContextView, ReaderDocumentMetadataView, ReaderMetadataView,
+    ReaderPageMetadataView, ReaderRegionBoxView, ReaderRegionItemView, ReaderRegionsView,
+    RetryStageKind, RetryStageRequest, RetryStageSubmissionView, StageActionsView,
+    StageRetryActionLinkView, StageRetryActionView, TranslationDebugIndexView,
+    TranslationDebugItemView, TranslationDebugListItemView, TranslationDebugListView,
+    TranslationDiagnosticsView, TranslationReplayView,
 };

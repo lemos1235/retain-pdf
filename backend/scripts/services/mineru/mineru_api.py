@@ -13,8 +13,10 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 from foundation.shared.local_env import get_secret
 from services.network.retry import RetainNetworkError
 from services.network.retry import RetainRateLimitError
+from services.network.retry import stepped_poll_interval
 from services.network.retry import direct_session
 from services.network.retry import request_with_retry
+from services.network.retry import sanitize_url_for_log
 
 
 MINERU_BASE_URL = "https://mineru.net"
@@ -156,8 +158,8 @@ def apply_upload_url(
 
 
 def upload_file(upload_url: str, file_path: Path) -> None:
-    with file_path.open("rb") as f:
-        request_mineru("put", upload_url, data=f, timeout=300)
+    file_bytes = file_path.read_bytes()
+    request_mineru("put", upload_url, data=file_bytes, timeout=300)
 
 
 def query_batch_status(token: str, batch_id: str) -> dict[str, Any]:
@@ -193,9 +195,10 @@ def poll_until_done(
         if state == "failed":
             err_msg = data.get("data", {}).get("err_msg", "")
             raise RuntimeError(f"MinerU task failed: {err_msg or 'unknown error'}")
-        if time.time() - started > timeout_seconds:
+        elapsed = time.time() - started
+        if elapsed > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for MinerU task {task_id}")
-        time.sleep(interval_seconds)
+        time.sleep(stepped_poll_interval(elapsed, interval_seconds))
 
 
 def parse_extra_formats(value: str) -> list[str]:
@@ -281,7 +284,7 @@ def main() -> None:
             data_id=args.data_id,
         )
         print(f"batch_id: {batch_id}")
-        print(f"upload_url: {upload_url}")
+        print(f"upload_url: {sanitize_url_for_log(upload_url)}")
         upload_file(upload_url, file_path)
         print(f"upload done: {file_path}")
 
@@ -324,7 +327,7 @@ def main() -> None:
 
     full_zip_url = result_data.get("full_zip_url", "")
     if full_zip_url:
-        print(f"full_zip_url: {full_zip_url}")
+        print(f"full_zip_url: {sanitize_url_for_log(full_zip_url)}")
 
 
 if __name__ == "__main__":

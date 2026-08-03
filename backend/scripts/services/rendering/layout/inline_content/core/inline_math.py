@@ -26,6 +26,9 @@ ANGLE_EXPECTATION_RE = re.compile(
 BARE_ANGLE_EXPECTATION_RE = re.compile(
     r"\\langle\s*(?P<body>[^$]+?)\s*\\rangle"
 )
+LATEX_SIZED_DELIMITER_RE = re.compile(
+    r"\\(?:left|right)\s*(?P<delimiter>\\langle|\\rangle|[⟨⟩|()\[\]{}.]|\\[{}])"
+)
 
 
 def apply_to_non_math_segments(text: str, replacer) -> str:
@@ -238,6 +241,22 @@ def normalize_angle_bracket_expectation_for_mitex(expr: str) -> str:
     )
 
 
+def normalize_sized_delimiters_for_mitex(expr: str) -> str:
+    def _replacement(match: re.Match[str]) -> str:
+        delimiter = match.group("delimiter")
+        if delimiter in {r"\langle", "⟨"}:
+            return "⟨"
+        if delimiter in {r"\rangle", "⟩"}:
+            return "⟩"
+        if delimiter == ".":
+            return ""
+        if delimiter in {r"\{", r"\}"}:
+            return delimiter[-1]
+        return delimiter
+
+    return LATEX_SIZED_DELIMITER_RE.sub(_replacement, expr or "")
+
+
 def sanitize_direct_typst_inline_math(text: str) -> str:
     from services.rendering.layout.inline_content.fallback.latex_normalizer import (
         normalize_formula_for_latex_math,
@@ -258,11 +277,19 @@ def sanitize_direct_typst_inline_math(text: str) -> str:
         expr = re.sub(r"\\angle(?=[A-Za-z])", r"\\angle ", expr)
         expr = re.sub(r"\\mathscr\b", r"\\mathcal", expr)
         expr = re.sub(r"\\varPhi(?=[^A-Za-z]|$)", r"\\Phi", expr)
-        expr = re.sub(r"\\hbar\b", "hbar", expr)
+        expr = re.sub(r"\\hbar\b", "ℏ", expr)
         expr = re.sub(r"\\partial\b", "∂", expr)
+        expr = re.sub(r"\\otimes\b", "⊗", expr)
+        expr = normalize_sized_delimiters_for_mitex(expr)
         expr = normalize_angle_bracket_expectation_for_mitex(expr)
         expr = re.sub(r"\\langle\b", "⟨", expr)
         expr = re.sub(r"\\rangle\b", "⟩", expr)
+        expr = normalize_sized_delimiters_for_mitex(expr)
+        # Do not rewrite prefix scripts (e.g. ⟨^{N} → ⟨{}^{N}).
+        # That regex treated LaTeX "\ " (backslash-space) as a delimiter and
+        # corrupted temperatures like -78\ ^{\circ}\mathrm{C} into -78\{}^{\circ}...
+        # Prefix-script form is owned by translation (protect / match-then-translate);
+        # rendering only does light mitex-compatible delimiter/symbol cleanup.
         expr = re.sub(r"\\circled\s*\{\s*\\times\s*\}", r"\\otimes", expr)
         expr = re.sub(r"\\circled\s*\{\s*\\parallel\s*\}", r"\\circ", expr)
         expr = re.sub(r"\\circled\s*\{\s*([^{}]+?)\s*\}", r"\1", expr)

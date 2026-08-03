@@ -5,6 +5,7 @@ from concurrent.futures import as_completed
 from dataclasses import dataclass
 
 from services.translation.core.payload import apply_translated_text_map
+from services.translation.core.payload.parts.diagnostics import record_translation_diagnostics
 from services.translation.services.agents.coordinator import TranslationAgentCoordinator
 from services.translation.services.agents.repair import TranslationRepairRequest
 from services.translation.services.agents.repair import RepairAgent
@@ -21,6 +22,17 @@ BLOCKING_REPAIR_ISSUE_KINDS = {
     "unexpected_placeholder",
     "math_delimiter_unbalanced",
     "context_bleed",
+}
+RESIDUE_ISSUE_KINDS = {
+    "english_residue",
+    "mixed_english_residue",
+    "english_residue_warning",
+}
+# 重试链已对同类残留反复重试并放弃接受的标记:agent 修复重复同样的
+# 要求只会得到同样被重验拒绝的结果(实测 8 个候选 6 个失败的主因)。
+RESIDUE_EXHAUSTED_DEGRADATION_REASONS = {
+    "english_residue_repeated",
+    "english_residue_partial_accept",
 }
 DEFAULT_AGENT_REPAIR_WORKERS = 8
 MAX_AGENT_REPAIR_WORKERS = 16
@@ -70,6 +82,12 @@ def run_agent_repair_pipeline(
             skipped += 1
             _record_agent_repair_skip(item, "continuation_group_member", [])
             continue
+        if _already_repaired_in_flight(item):
+            # 重试链的定界符修复/乱码重建已经成功处理过,不再追打
+            # 一次 70s 档的 agent 修复调用。
+            skipped += 1
+            _record_agent_repair_skip(item, "already_repaired_in_flight", [])
+            continue
         translated_result = translated_results.get(item_id, {}) or {}
         review = coordinator.review_batch([item], {item_id: translated_result})
         reviewed += review.reviewed_item_count
@@ -79,6 +97,12 @@ def run_agent_repair_pipeline(
             continue
         issues = _repairable_review_issues(review)
         if not issues:
+            continue
+        if _is_exhausted_residue_candidate(item, issues):
+            # 候选问题全是英文残留,而重试链已对同一残留反复重试并放弃:
+            # 修复输出仍是同样的英文,重验必拒,纯浪费调用。
+            skipped += 1
+            _record_agent_repair_skip(item, "residue_retries_exhausted", issues)
             continue
         candidates.append((item, translated_result, issues))
 
@@ -206,6 +230,22 @@ def _has_blocking_issue(issues: list[TranslationQualityIssue]) -> bool:
     return any(issue.kind in BLOCKING_REPAIR_ISSUE_KINDS for issue in issues)
 
 
+def _already_repaired_in_flight(item: dict) -> bool:
+    from services.translation.artifacts.status import has_repaired_translation_artifact
+
+    diagnostics = dict(item.get("translation_diagnostics") or {})
+    if has_repaired_translation_artifact(item, diagnostics):
+        return True
+    return str(diagnostics.get("degradation_reason", "") or "") == "typst_math_repaired"
+
+
+def _is_exhausted_residue_candidate(item: dict, issues: list[TranslationQualityIssue]) -> bool:
+    if not issues or not all(issue.kind in RESIDUE_ISSUE_KINDS for issue in issues):
+        return False
+    diagnostics = dict(item.get("translation_diagnostics") or {})
+    return str(diagnostics.get("degradation_reason", "") or "") in RESIDUE_EXHAUSTED_DEGRADATION_REASONS
+
+
 def _is_group_member_item(item: dict) -> bool:
     if str(item.get("continuation_group", "") or "").strip():
         return True
@@ -218,19 +258,27 @@ def _should_skip_policy_keep_origin_item(item: dict) -> bool:
 
 
 def _record_agent_repair_skip(item: dict, reason: str, issues: list[TranslationQualityIssue]) -> None:
-    diagnostics = dict(item.get("translation_diagnostics") or {})
-    diagnostics["agent_repair_skipped"] = True
-    diagnostics["agent_repair_skip_reason"] = reason
-    diagnostics["agent_repair_issue_kinds"] = [issue.kind for issue in issues]
-    item["translation_diagnostics"] = diagnostics
+    record_translation_diagnostics(
+        item,
+        "agent_repair",
+        {
+            "agent_repair_skipped": True,
+            "agent_repair_skip_reason": reason,
+            "agent_repair_issue_kinds": [issue.kind for issue in issues],
+        },
+    )
 
 
 def _record_agent_repair_failure(item: dict, exc: Exception) -> None:
-    diagnostics = dict(item.get("translation_diagnostics") or {})
-    diagnostics["agent_repair_failed"] = True
-    diagnostics["agent_repair_error_type"] = type(exc).__name__
-    diagnostics["agent_repair_error"] = str(exc)
-    item["translation_diagnostics"] = diagnostics
+    record_translation_diagnostics(
+        item,
+        "agent_repair",
+        {
+            "agent_repair_failed": True,
+            "agent_repair_error_type": type(exc).__name__,
+            "agent_repair_error": str(exc),
+        },
+    )
 
 
 def _validate_repair_result(item: dict, repaired_text: str) -> list[TranslationQualityIssue]:
@@ -250,13 +298,17 @@ def _validate_repair_result(item: dict, repaired_text: str) -> list[TranslationQ
 
 
 def _record_agent_repair_rejected(item: dict, issues: list[TranslationQualityIssue]) -> None:
-    diagnostics = dict(item.get("translation_diagnostics") or {})
-    diagnostics["agent_repair_failed"] = True
-    diagnostics["agent_repair_error_type"] = "RepairValidationError"
-    diagnostics["agent_repair_error"] = "Repair output failed translation quality validation."
-    diagnostics["agent_repair_issue_kinds"] = [issue.kind for issue in issues]
-    diagnostics["agent_repair_issues"] = [issue.as_dict() for issue in issues]
-    item["translation_diagnostics"] = diagnostics
+    record_translation_diagnostics(
+        item,
+        "agent_repair",
+        {
+            "agent_repair_failed": True,
+            "agent_repair_error_type": "RepairValidationError",
+            "agent_repair_error": "Repair output failed translation quality validation.",
+            "agent_repair_issue_kinds": [issue.kind for issue in issues],
+            "agent_repair_issues": [issue.as_dict() for issue in issues],
+        },
+    )
 
 
 __all__ = [

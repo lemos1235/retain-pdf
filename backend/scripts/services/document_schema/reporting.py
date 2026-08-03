@@ -7,7 +7,10 @@ from pathlib import Path
 def load_normalization_report(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Stream-read; do NOT import services.pipeline_shared here —
+    # pipeline_shared.summary imports document_schema and would circular-import.
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _sum_default_hits(payload: dict | None) -> int:

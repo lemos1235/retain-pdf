@@ -9,7 +9,6 @@ from foundation.shared.local_env import get_secret
 from services.document_schema.adapters import adapt_path_to_document_v1_with_report
 from services.document_schema.providers import PROVIDER_MINERU
 from services.document_schema.reporting import build_normalization_summary
-from services.document_schema import validate_saved_document_path
 from services.mineru.artifacts import build_mineru_artifact_paths
 from services.mineru.artifacts import download_and_unpack_bundle
 from services.mineru.artifacts import ensure_source_pdf_from_bundle
@@ -17,7 +16,6 @@ from services.mineru.artifacts import resolve_layout_json_path
 from services.mineru.artifacts import save_json
 from services.mineru.mineru_api import MINERU_ENV_FILE
 from services.mineru.mineru_api import MINERU_TOKEN_ENV
-from services.mineru.mineru_api import build_headers as build_mineru_headers
 from services.mineru.mineru_api import parse_extra_formats
 from services.mineru.submission import run_local_extract_task
 from services.mineru.submission import run_remote_extract_task
@@ -50,9 +48,11 @@ def _materialize_normalized_document(
         provider=PROVIDER_MINERU,
         provider_version=provider_version,
     )
-    save_json(normalized_json_path, normalized_document)
+    save_json(normalized_json_path, normalized_document, compact=True)
     save_json(normalized_report_json_path, normalization_report)
-    report = validate_saved_document_path(normalized_json_path)
+    # The adapter already validated the document; reuse its report instead of
+    # re-reading and re-validating the saved file.
+    report = normalization_report["validation"]
     normalization_summary = build_normalization_summary(normalization_report)
     print(
         "normalized document validated: "
@@ -131,11 +131,12 @@ def run_mineru_to_job_dir(args: Namespace) -> tuple[JobDirs, Path, Path, Path]:
     if not full_zip_url:
         raise RuntimeError("MinerU result does not contain full_zip_url.")
 
+    # full_zip_url is a presigned CDN/object-store URL; the MinerU bearer token
+    # must not be forwarded to it (would leak into CDN logs cross-origin).
     download_and_unpack_bundle(
         full_zip_url=full_zip_url,
         zip_path=artifact_paths.bundle_zip_path,
         unpack_dir=artifact_paths.unpack_dir,
-        headers=build_mineru_headers(mineru_token),
     )
 
     source_pdf_path = ensure_source_pdf_from_bundle(

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 
-REPO_SCRIPTS_ROOT = Path("/home/wxyhgk/tmp/Code/backend/scripts")
+REPO_SCRIPTS_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_SCRIPTS_ROOT))
 
 
@@ -495,7 +495,8 @@ def test_build_translation_context_from_policy_uses_policy_guidance() -> None:
     assert "extra-guidance" in context.merged_guidance
     assert "snippet" in context.merged_guidance
     assert context.engine_profile_name == "balanced"
-    assert context.batch_policy.plain_batch_size == 6
+    # 多条目批处理已退役,默认单条请求
+    assert context.batch_policy.plain_batch_size == 1
 
 
 def test_build_translation_context_uses_model_profile_overrides() -> None:

@@ -8,6 +8,8 @@ from .common import (
     existing_group_unit_id,
     is_group_unit_id,
 )
+from .final_status import TRANSLATED_STATUS
+from .final_status import set_final_status
 from .group_split import math_spans
 from .group_split import split_group_protected_translation
 from .result_entries import extract_result_metadata
@@ -161,7 +163,7 @@ def apply_group_translated_entry(items: list[dict], raw_result) -> None:
             diagnostics["group_member_translation_source"] = "structured"
         if diagnostics:
             item["translation_diagnostics"] = diagnostics
-        item["final_status"] = str(metadata.get("final_status", "") or "translated")
+        set_final_status(item, str(metadata.get("final_status", "") or TRANSLATED_STATUS))
 
 
 def apply_single_translated_entry(
@@ -224,7 +226,21 @@ def apply_single_translated_entry(
     diagnostics = result_diagnostics_for_item(metadata, item)
     if diagnostics:
         item["translation_diagnostics"] = diagnostics
-    item["final_status"] = str(metadata.get("final_status", "") or "translated")
+    set_final_status(item, str(metadata.get("final_status", "") or TRANSLATED_STATUS))
+
+
+def apply_reconstructed_unit_text(items: list[dict], translated_text: str) -> None:
+    # 乱码重建的整单元替换写入:重建输出是成品显示文本(调用方已完成
+    # reasoning 泄漏清洗与占位符还原),整个单元共用同一段译文,
+    # 六个译文字段同值落盘,group_* 与 translation_unit_* 天然保持同步。
+    # 不做邻段泄漏裁剪与 mixed_literal 拼接——那些针对逐项翻译输出。
+    for item in items:
+        item["protected_translated_text"] = translated_text
+        item["translated_text"] = translated_text
+        item["translation_unit_protected_translated_text"] = translated_text
+        item["translation_unit_translated_text"] = translated_text
+        item["group_protected_translated_text"] = translated_text
+        item["group_translated_text"] = translated_text
 
 
 def apply_translated_text_map(payload: list[dict], translated: dict) -> None:

@@ -27,6 +27,10 @@ from services.translation.core.terms import normalize_glossary_entries
 
 INLINE_MATH_SPAN_RE = re.compile(r"(?<!\\)\$(?:\\.|[^$\\\n])+(?<!\\)\$")
 SOURCE_TERMINAL_RE = re.compile(r"[.!?。！？；;:：)\]）】”’\"']\s*$")
+# EN→ZH technical prose is typically ~0.3–0.5 of source char length. Flag only
+# extreme tail-only / partial outputs so normal dense translations stay clean.
+TRUNCATION_MIN_SOURCE_CHARS = 200
+TRUNCATION_MAX_RATIO = 0.15
 
 
 @dataclass(frozen=True)
@@ -155,7 +159,7 @@ def review_translation_item(
 
     issues.extend(_review_translated_text(item, item_id, source_text, translated_text))
     if not is_direct_math_mode(item):
-        issues.extend(_review_placeholders(item_id, source_text, translated_text))
+        issues.extend(review_placeholders(item_id, source_text, translated_text))
     issues.extend(_review_glossary_terms(item_id, source_text, translated_text, normalized_glossary))
     return TranslationQualityReport(issues=issues, reviewed_item_count=1)
 
@@ -195,13 +199,20 @@ def _review_translated_text(
                 message="Translated output still contains JSON/protocol shell",
             )
         )
+    truncation = _truncated_translation_issue(item_id, source_text, translated_text)
+    if truncation is not None:
+        issues.append(truncation)
     context_bleed = _context_bleed_leaked_math(item, source_text, translated_text)
     if context_bleed:
+        # 连续段片段按设计就是"无终止标点的不完整句",此检查对它们必然
+        # 高频触发;而 apply 层的 _sanitize_neighbor_continuation_leak 已经
+        # 能确定性修剪泄漏的后文公式。对连续段降级为警告,避免为机械层
+        # 可修复的问题反复重试;独立条目仍保持硬错误。
         issues.append(
             TranslationQualityIssue(
                 item_id=item_id,
                 kind="context_bleed",
-                severity="error",
+                severity="warning" if _is_continuation_item(item) else "error",
                 message="Translated output appears to include following context not present in current source",
                 details={"leaked_math": context_bleed[:5]},
             )
@@ -241,11 +252,47 @@ def _math_spans(text: str) -> list[str]:
     return [match.group(0).strip() for match in INLINE_MATH_SPAN_RE.finditer(str(text or "")) if match.group(0).strip()]
 
 
+def _truncated_translation_issue(
+    item_id: str,
+    source_text: str,
+    translated_text: str,
+) -> TranslationQualityIssue | None:
+    source = str(source_text or "").strip()
+    translated = str(translated_text or "").strip()
+    if len(source) < TRUNCATION_MIN_SOURCE_CHARS or not translated:
+        return None
+    ratio = len(translated) / len(source)
+    if ratio >= TRUNCATION_MAX_RATIO:
+        return None
+    return TranslationQualityIssue(
+        item_id=item_id,
+        kind="truncated_translation",
+        severity="error",
+        message=(
+            f"Translated output is abnormally short vs source "
+            f"(ratio={ratio:.3f}, source_chars={len(source)}, translated_chars={len(translated)})"
+        ),
+        details={
+            "ratio": round(ratio, 4),
+            "source_chars": len(source),
+            "translated_chars": len(translated),
+            "min_source_chars": TRUNCATION_MIN_SOURCE_CHARS,
+            "max_ratio": TRUNCATION_MAX_RATIO,
+        },
+    )
+
+
 def _source_looks_incomplete(text: str) -> bool:
     source = str(text or "").strip()
     if not source:
         return False
     return SOURCE_TERMINAL_RE.search(source) is None
+
+
+def _is_continuation_item(item: dict) -> bool:
+    return bool(str(item.get("continuation_group", "") or "").strip()) or str(
+        item.get("translation_unit_id", "") or ""
+    ).startswith("__cg__:")
 
 
 def _context_bleed_leaked_math(item: dict, source_text: str, translated_text: str) -> list[str]:
@@ -262,7 +309,7 @@ def _context_bleed_leaked_math(item: dict, source_text: str, translated_text: st
     ]
 
 
-def _review_placeholders(item_id: str, source_text: str, translated_text: str) -> list[TranslationQualityIssue]:
+def review_placeholders(item_id: str, source_text: str, translated_text: str) -> list[TranslationQualityIssue]:
     issues: list[TranslationQualityIssue] = []
     source_placeholders = placeholders(source_text)
     translated_placeholders = placeholders(translated_text)
@@ -345,6 +392,7 @@ def _review_glossary_terms(
 __all__ = [
     "TranslationQualityIssue",
     "TranslationQualityReport",
+    "review_placeholders",
     "review_translation_batch",
     "review_translation_item",
     "should_reject_keep_origin",

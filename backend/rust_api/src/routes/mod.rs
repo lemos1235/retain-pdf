@@ -1,3 +1,5 @@
+pub mod ai_proxy;
+pub mod collections;
 pub mod common;
 pub(crate) mod download_response;
 pub mod glossaries;
@@ -6,5 +8,7 @@ pub mod job_helpers;
 pub mod job_requests;
 pub mod jobs;
 pub mod library;
+pub mod library_data;
+pub mod library_extras;
 pub mod providers;
 pub mod uploads;

@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 from services.translation.core.item_reader import item_block_kind
+from services.translation.core.payload.formula_protection import restore_protected_tokens
+from services.translation.core.payload.parts.apply import apply_reconstructed_unit_text
+from services.translation.core.payload.parts.diagnostics import record_translation_diagnostics
+from services.translation.core.payload.parts.final_status import TRANSLATED_STATUS
+from services.translation.core.payload.parts.final_status import set_final_status
+from services.translation.core.payload.parts.policy_state import mark_translation_required
+from services.translation.core.payload.parts.result_entries import salvage_reasoning_leak
 from services.translation.llm.shared.structured_models import GARBLED_RECONSTRUCTION_RESPONSE_SCHEMA
 from services.translation.llm.shared.structured_parsers import parse_garbled_reconstruction_response
 from services.translation.artifacts.status import has_translation_artifact
@@ -199,33 +206,43 @@ def _repair_item_translation(item: dict, *, runtime: GarbledReconstructionRuntim
     return parse_garbled_reconstruction_response(content)
 
 
+def _clean_reconstructed_text(text: str, item: dict) -> tuple[str, bool]:
+    # 复用主翻译回填的清洗:剥离模型 reasoning 泄漏,再还原占位符。
+    # 其它翻译/修复路径都经 apply.py 做这两步,唯独乱码重建曾直接落盘模型原始输出。
+    salvaged, salvage_changed = salvage_reasoning_leak(text)
+    protected_map = item.get("protected_map") or item.get("formula_map", [])
+    return restore_protected_tokens(salvaged, protected_map), salvage_changed
+
+
 def _apply_reconstruction(items: list[dict], translated_text: str) -> None:
-    if not translated_text:
+    if not translated_text or not items:
         return
-    validation_issues = _validate_reconstruction(items[0], translated_text) if items else []
+    cleaned_text, salvaged = _clean_reconstructed_text(translated_text, items[0])
+    # 用清洗后的文本做质量校验:落盘什么就校验什么。
+    validation_issues = _validate_reconstruction(items[0], cleaned_text)
     if validation_issues:
         for item in items:
             _record_reconstruction_rejected(item, validation_issues)
         return
+    apply_reconstructed_unit_text(items, cleaned_text)
     for item in items:
-        item["protected_translated_text"] = translated_text
-        item["translated_text"] = translated_text
-        item["translation_unit_protected_translated_text"] = translated_text
-        item["translation_unit_translated_text"] = translated_text
-        item["group_protected_translated_text"] = translated_text
-        item["group_translated_text"] = translated_text
-        item["classification_label"] = "llm_reconstructed_garbled"
-        item["skip_reason"] = ""
-        item["final_status"] = "translated"
-        diagnostics = dict(item.get("translation_diagnostics") or {})
-        diagnostics["final_status"] = "translated"
-        diagnostics["garbled_reconstructed"] = True
-        diagnostics["degradation_reason"] = "garbled_reconstructed"
-        diagnostics["fallback_to"] = ""
-        route_path = [str(part or "") for part in diagnostics.get("route_path") or [] if str(part or "")]
+        # 候选资格已保证 should_translate=True(verdict 会把显式 False 挡在
+        # should_skip_model_by_policy 之外),此处写 True 为恒等操作。
+        mark_translation_required(item, label="llm_reconstructed_garbled")
+        set_final_status(item, TRANSLATED_STATUS)
+        prior = dict(item.get("translation_diagnostics") or {})
+        route_path = [str(part or "") for part in prior.get("route_path") or [] if str(part or "")]
         route_path = [part for part in route_path if part != "failed"]
-        diagnostics["route_path"] = route_path + ["garbled_reconstruction"]
-        item["translation_diagnostics"] = diagnostics
+        updates = {
+            "final_status": "translated",
+            "garbled_reconstructed": True,
+            "degradation_reason": "garbled_reconstructed",
+            "fallback_to": "",
+            "route_path": route_path + ["garbled_reconstruction"],
+        }
+        if salvaged:
+            updates["reasoning_leak_salvaged"] = True
+        record_translation_diagnostics(item, "garbled_reconstruction", updates)
 
 
 def _candidate_key(item: dict) -> str:
@@ -249,11 +266,15 @@ def _validate_reconstruction(item: dict, translated_text: str) -> list:
 
 
 def _record_reconstruction_rejected(item: dict, issues: list) -> None:
-    diagnostics = dict(item.get("translation_diagnostics") or {})
-    diagnostics["garbled_reconstruction_rejected"] = True
-    diagnostics["garbled_reconstruction_issue_kinds"] = [issue.kind for issue in issues]
-    diagnostics["garbled_reconstruction_issues"] = [issue.as_dict() for issue in issues]
-    item["translation_diagnostics"] = diagnostics
+    record_translation_diagnostics(
+        item,
+        "garbled_reconstruction",
+        {
+            "garbled_reconstruction_rejected": True,
+            "garbled_reconstruction_issue_kinds": [issue.kind for issue in issues],
+            "garbled_reconstruction_issues": [issue.as_dict() for issue in issues],
+        },
+    )
 
 
 def _collect_candidates(items: list[dict]) -> tuple[dict[str, list[dict]], dict[str, dict]]:

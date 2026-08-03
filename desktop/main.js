@@ -1,177 +1,59 @@
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("child_process");
 const fs = require("fs");
-const http = require("http");
-const net = require("net");
 const path = require("path");
+const {
+  canConnectToPort,
+  createBackendStartupDiagnostics,
+  waitForPort,
+} = require("./src/main/backend-startup-diagnostics");
+const { buildBackendEnv } = require("./src/main/backend-env");
+const { createBackendHttp } = require("./src/main/backend-http");
+const { createBackendRuntime } = require("./src/main/backend-runtime");
+const { createDesktopConfigStore } = require("./src/main/desktop-config");
+const { createDesktopLogger } = require("./src/main/desktop-logging");
+const { createDesktopWindows } = require("./src/main/desktop-windows");
+
+const desktopLogger = createDesktopLogger(app);
+const {
+  appendDesktopLog,
+  getDesktopLogPath,
+  logDesktop,
+  logDesktopError,
+  resolveDesktopLogPath,
+  setDesktopLogPath,
+} = desktopLogger;
+const backendStartupDiagnostics = createBackendStartupDiagnostics({ getDesktopLogPath });
+const backendRuntime = createBackendRuntime(app, { appRoot: __dirname });
+const {
+  bundledPythonImportPaths,
+  preparePythonRuntime,
+  resolveBackendBinary,
+  resolveBackendRoot,
+  resolveBundledPythonHome,
+  resolvePythonRuntime,
+  resolveTypstBinary,
+} = backendRuntime;
 
 const DESKTOP_API_KEY = "retain-pdf-desktop";
+const backendHttp = createBackendHttp({
+  desktopApiKey: DESKTOP_API_KEY,
+  logger: console,
+});
+const { canReuseExistingBackend } = backendHttp;
+const desktopConfigStore = createDesktopConfigStore(app, { desktopApiKey: DESKTOP_API_KEY });
+const {
+  buildDesktopConfigResponse,
+  loadDesktopConfig,
+  saveDesktopConfig,
+} = desktopConfigStore;
 let backendChild = null;
+let aiServiceChild = null;
 let backendStopping = false;
 let splashWindow = null;
-let mainWindow = null;
 let usingExternalBackend = false;
-let tray = null;
 let isQuitting = false;
-let closeToTrayHintShown = false;
-let desktopLogPath = "";
-
-const DEFAULT_OCR_PROVIDER = "paddle";
-const DEFAULT_MODEL = "deepseek-v4-flash";
-const DEFAULT_BASE_URL = "https://api.deepseek.com/v1";
-
-function resolveDesktopLogPath() {
-  try {
-    return path.join(app.getPath("userData"), "logs", "desktop-main.log");
-  } catch (_error) {
-    return "";
-  }
-}
-
-function appendDesktopLog(message) {
-  const logPath = desktopLogPath || resolveDesktopLogPath();
-  if (!logPath) {
-    return;
-  }
-  desktopLogPath = logPath;
-  try {
-    fs.mkdirSync(path.dirname(logPath), { recursive: true });
-    fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
-  } catch (_error) {
-    // Startup logging must never block application startup.
-  }
-}
-
-function logDesktop(message) {
-  console.log(message);
-  appendDesktopLog(message);
-}
-
-function logDesktopError(message) {
-  console.error(message);
-  appendDesktopLog(message);
-}
-
-function createDefaultDesktopConfig() {
-  return {
-    firstRunCompleted: false,
-    ocrProvider: DEFAULT_OCR_PROVIDER,
-    mineruToken: "",
-    paddleToken: "",
-    modelApiKey: "",
-    model: DEFAULT_MODEL,
-    baseUrl: DEFAULT_BASE_URL,
-    developerConfig: {},
-    closeToTrayHintShown: false,
-  };
-}
-
-function hasOwn(target, key) {
-  return Object.prototype.hasOwnProperty.call(target, key);
-}
-
-function normalizeOcrProvider(value) {
-  return value === "paddle" ? "paddle" : DEFAULT_OCR_PROVIDER;
-}
-
-function normalizeTrimmedString(value, fallback = "") {
-  return typeof value === "string" ? value.trim() : fallback;
-}
-
-function normalizeDesktopConfig(raw = {}) {
-  const defaults = createDefaultDesktopConfig();
-  return {
-    firstRunCompleted: !!raw.firstRunCompleted,
-    ocrProvider: normalizeOcrProvider(raw.ocrProvider),
-    mineruToken: normalizeTrimmedString(raw.mineruToken, defaults.mineruToken),
-    paddleToken: normalizeTrimmedString(raw.paddleToken, defaults.paddleToken),
-    modelApiKey: normalizeTrimmedString(raw.modelApiKey, defaults.modelApiKey),
-    model: normalizeTrimmedString(raw.model, defaults.model),
-    baseUrl: normalizeTrimmedString(raw.baseUrl, defaults.baseUrl),
-    developerConfig: typeof raw.developerConfig === "object" && raw.developerConfig !== null
-      ? { ...raw.developerConfig }
-      : {},
-    closeToTrayHintShown: !!raw.closeToTrayHintShown,
-  };
-}
-
-function mergeDesktopConfig(currentConfig, payload = {}) {
-  const merged = { ...currentConfig };
-  const runtimeConfig = typeof payload.runtimeConfig === "object" && payload.runtimeConfig !== null
-    ? payload.runtimeConfig
-    : {};
-  const keys = [
-    "ocrProvider",
-    "mineruToken",
-    "paddleToken",
-    "modelApiKey",
-    "model",
-    "baseUrl",
-    "closeToTrayHintShown",
-  ];
-  for (const key of keys) {
-    if (hasOwn(payload, key)) {
-      merged[key] = payload[key];
-      continue;
-    }
-    if (hasOwn(runtimeConfig, key)) {
-      merged[key] = runtimeConfig[key];
-    }
-  }
-  if (typeof payload.developerConfig === "object" && payload.developerConfig !== null) {
-    merged.developerConfig = { ...payload.developerConfig };
-  }
-  if (hasOwn(payload, "firstRunCompleted")) {
-    merged.firstRunCompleted = !!payload.firstRunCompleted;
-  }
-  return normalizeDesktopConfig(merged);
-}
-
-function buildBrowserConfig(config) {
-  return {
-    ocrProvider: config.ocrProvider || DEFAULT_OCR_PROVIDER,
-    mineruToken: config.mineruToken || "",
-    paddleToken: config.paddleToken || "",
-    modelApiKey: config.modelApiKey || "",
-  };
-}
-
-function resolveDesktopConfigPath() {
-  return path.join(app.getPath("userData"), "desktop-config.json");
-}
-
-function loadDesktopConfig() {
-  const configPath = resolveDesktopConfigPath();
-  if (!fs.existsSync(configPath)) {
-    return createDefaultDesktopConfig();
-  }
-  try {
-    const raw = fs.readFileSync(configPath, "utf8");
-    return normalizeDesktopConfig(JSON.parse(raw));
-  } catch (error) {
-    console.error(`[desktop] failed to load desktop config: ${error?.message || error}`);
-    return createDefaultDesktopConfig();
-  }
-}
-
-function saveDesktopConfig(payload = {}) {
-  const nextConfig = mergeDesktopConfig(loadDesktopConfig(), payload);
-  const configPath = resolveDesktopConfigPath();
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
-  return nextConfig;
-}
-
-function buildDesktopRuntimeConfig(config) {
-  return {
-    apiBase: "http://127.0.0.1:41000",
-    xApiKey: DESKTOP_API_KEY,
-    ...buildBrowserConfig(config),
-    model: config.model || DEFAULT_MODEL,
-    baseUrl: config.baseUrl || DEFAULT_BASE_URL,
-    developerConfig: config.developerConfig || {},
-  };
-}
+const AI_SERVICE_PORT = 41100;
 
 function updateSplashProgress(progress, title, detail) {
   if (!splashWindow || splashWindow.isDestroyed()) {
@@ -184,110 +66,35 @@ function updateSplashProgress(progress, title, detail) {
   });
 }
 
-function resolveWindowIcon() {
-  if (app.isPackaged) {
-    return path.join(__dirname, "assets", "RetainPDF-logo.png");
-  }
-  return path.join(__dirname, "assets", "RetainPDF-logo.png");
-}
-
-function resolveTrayIcon() {
-  return resolveWindowIcon();
-}
-
-function showMainWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return;
-  }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
-  }
-  mainWindow.show();
-  mainWindow.focus();
-}
-
-function showExistingDesktopWindow() {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    showMainWindow();
-    return true;
-  }
+function closeSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) {
-    if (splashWindow.isMinimized()) {
-      splashWindow.restore();
-    }
-    splashWindow.show();
-    splashWindow.focus();
-    return true;
+    splashWindow.close();
+    splashWindow = null;
   }
-  return false;
 }
 
-function hideMainWindowToTray() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return;
-  }
-  mainWindow.hide();
-  maybeShowCloseToTrayHint();
-}
-
-function persistCloseToTrayHintShown() {
-  const current = loadDesktopConfig();
-  saveDesktopConfig({
-    ...current,
-    closeToTrayHintShown: true,
-  });
-  closeToTrayHintShown = true;
-}
-
-function maybeShowCloseToTrayHint() {
-  if (closeToTrayHintShown || !tray) {
-    return;
-  }
-  if (process.platform === "win32" && typeof tray.displayBalloon === "function") {
-    tray.displayBalloon({
-      iconType: "info",
-      title: "RetainPDF 正在后台运行",
-      content: "窗口已隐藏到系统托盘，本地 API 仍可继续使用。右键托盘图标可退出。",
-    });
-  }
-  persistCloseToTrayHintShown();
-}
-
-function createTray() {
-  if (tray) {
-    return tray;
-  }
-  tray = new Tray(resolveTrayIcon());
-  tray.setToolTip("RetainPDF");
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      {
-        label: "显示主窗口",
-        click: () => {
-          showMainWindow();
-        },
-      },
-      {
-        label: "退出",
-        click: () => {
-          isQuitting = true;
-          app.quit();
-        },
-      },
-    ]),
-  );
-  tray.on("click", () => {
-    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
-      hideMainWindowToTray();
-      return;
-    }
-    showMainWindow();
-  });
-  tray.on("double-click", () => {
-    showMainWindow();
-  });
-  return tray;
-}
+const desktopWindows = createDesktopWindows(app, {
+  appRoot: __dirname,
+  closeSplashWindow,
+  isQuitting: () => isQuitting,
+  loadDesktopConfig,
+  logDesktop,
+  logDesktopError,
+  markQuitting: () => {
+    isQuitting = true;
+  },
+  saveDesktopConfig,
+  updateSplashProgress,
+});
+const {
+  createTray,
+  createWindow,
+  hasLiveMainWindow,
+  resolveWindowIcon,
+  setCloseToTrayHintShown,
+  showExistingDesktopWindow,
+  showMainWindow,
+} = desktopWindows;
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -295,7 +102,7 @@ if (!gotSingleInstanceLock) {
 } else {
   app.on("second-instance", () => {
     logDesktop("[desktop] second instance requested; restoring existing window");
-    showExistingDesktopWindow();
+    showExistingDesktopWindow(splashWindow);
   });
 }
 
@@ -323,339 +130,6 @@ async function createSplashWindow() {
   updateSplashProgress(6, "正在准备运行环境", "正在检查桌面组件与本地资源");
 }
 
-function waitForPort(host, port, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const startedAt = Date.now();
-
-    function tryConnect() {
-      const socket = net.connect({ host, port });
-      socket.once("connect", () => {
-        socket.destroy();
-        resolve();
-      });
-      socket.once("error", () => {
-        socket.destroy();
-        if (Date.now() - startedAt >= timeoutMs) {
-          reject(new Error(`backend did not become ready on ${host}:${port}`));
-          return;
-        }
-        setTimeout(tryConnect, 500);
-      });
-    }
-
-    tryConnect();
-  });
-}
-
-function canConnectToPort(host, port, timeoutMs = 800) {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host, port });
-    const done = (result) => {
-      socket.destroy();
-      resolve(result);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-  });
-}
-
-function requestJson(url, headers = {}, timeoutMs = 2000) {
-  return new Promise((resolve, reject) => {
-    const request = http.get(
-      url,
-      {
-        headers,
-        timeout: timeoutMs,
-      },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk) => {
-          body += chunk;
-        });
-        response.on("end", () => {
-          if (response.statusCode && response.statusCode >= 400) {
-            reject(new Error(`http ${response.statusCode}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(error);
-          }
-        });
-      },
-    );
-    request.on("timeout", () => {
-      request.destroy(new Error("request timeout"));
-    });
-    request.on("error", reject);
-  });
-}
-
-async function canReuseExistingBackend(apiPort) {
-  const healthUrl = `http://127.0.0.1:${apiPort}/health`;
-  const jobsUrl = `http://127.0.0.1:${apiPort}/api/v1/jobs?limit=1&offset=0`;
-  try {
-    const healthPayload = await requestJson(healthUrl, {}, 2000);
-    if (!(healthPayload && healthPayload.data && healthPayload.data.status === "up")) {
-      return false;
-    }
-    const jobsPayload = await requestJson(jobsUrl, {
-      "x-api-key": DESKTOP_API_KEY,
-    }, 3000);
-    return Array.isArray(jobsPayload?.data?.items);
-  } catch (error) {
-    console.warn(
-      `[desktop] existing backend on :${apiPort} is not reusable: ${error?.message || error}`,
-    );
-    return false;
-  }
-}
-
-function resolveBackendRoot() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, "backend");
-  }
-  return path.join(__dirname, "app", "backend");
-}
-
-function resolveBackendBinary(backendRoot) {
-  const candidates = process.platform === "win32"
-    ? [path.join(backendRoot, "bin", "rust_api.exe")]
-    : [path.join(backendRoot, "bin", "rust_api")];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return candidates[0];
-}
-
-function resolvePythonRuntime(backendRoot) {
-  const bundledRoot = path.join(backendRoot, "python");
-  const bundledCandidates = process.platform === "win32"
-    ? [path.join(bundledRoot, "python.exe")]
-    : [
-        path.join(bundledRoot, "bin", "python3"),
-        path.join(bundledRoot, "bin", "python"),
-      ];
-  for (const candidate of bundledCandidates) {
-    if (fs.existsSync(candidate)) {
-      return { command: candidate, bundledHome: bundledRoot };
-    }
-  }
-  if (app.isPackaged) {
-    return { command: "", bundledHome: null };
-  }
-  return { command: "python3", bundledHome: null };
-}
-
-function resolveBundledPythonHome(bundledHome) {
-  if (!bundledHome || !fs.existsSync(bundledHome)) {
-    return "";
-  }
-  if (process.platform === "darwin") {
-    const frameworkHome = path.join(
-      bundledHome,
-      "Frameworks",
-      "Python.framework",
-      "Versions",
-      "Current",
-    );
-    if (fs.existsSync(frameworkHome)) {
-      return frameworkHome;
-    }
-  }
-  if (!fs.existsSync(path.join(bundledHome, "pyvenv.cfg"))) {
-    return bundledHome;
-  }
-  return "";
-}
-
-function buildPythonProbeScript(includeDependencyImports) {
-  if (!includeDependencyImports) {
-    return [
-      "import sys",
-      "print(sys.executable, flush=True)",
-      "print(f'prefix={sys.prefix} exec_prefix={sys.exec_prefix} base_exec_prefix={sys.base_exec_prefix}', flush=True)",
-      "print('python_runtime_startup_check=ok', flush=True)",
-    ].join("\n");
-  }
-
-  return [
-    "import importlib",
-    "import sys",
-    "print(sys.executable, flush=True)",
-    "print(f'prefix={sys.prefix} exec_prefix={sys.exec_prefix} base_exec_prefix={sys.base_exec_prefix}', flush=True)",
-    "for module_name in ['_socket', 'socket', 'ssl', 'requests', 'fitz', 'pikepdf', 'PIL', 'urllib3']:",
-    "    print(f'importing:{module_name}', flush=True)",
-    "    importlib.import_module(module_name)",
-    "    print(f'imported:{module_name}', flush=True)",
-    "print('python_runtime_import_check=ok', flush=True)",
-  ].join("\n");
-}
-
-function probePythonRuntime(runtime, options = {}) {
-  const {
-    timeoutMs = 8000,
-    includeDependencyImports = true,
-  } = options;
-  return new Promise((resolve) => {
-    if (!runtime || !runtime.command) {
-      resolve({ ok: false, reason: "missing_python_command" });
-      return;
-    }
-    const env = {
-      ...process.env,
-      PYTHONUNBUFFERED: "1",
-      PYTHONUTF8: "1",
-    };
-    const pythonImportPaths = bundledPythonImportPaths(runtime.bundledHome);
-    if (pythonImportPaths.length > 0) {
-      env.PYTHONPATH = [
-        ...pythonImportPaths,
-        process.env.PYTHONPATH || "",
-      ].filter(Boolean).join(path.delimiter);
-    }
-    const bundledPythonHome = resolveBundledPythonHome(runtime.bundledHome);
-    if (bundledPythonHome) {
-      env.PYTHONHOME = bundledPythonHome;
-    } else {
-      delete env.PYTHONHOME;
-    }
-    const child = spawn(
-      runtime.command,
-      [
-        "-c",
-        buildPythonProbeScript(includeDependencyImports),
-      ],
-      {
-        env,
-        windowsHide: process.platform === "win32",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        timedOut,
-        reason: String(error && error.message ? error.message : error),
-        stdout,
-        stderr,
-      });
-    });
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve({ ok: true, stdout: stdout.trim(), stderr: stderr.trim() });
-        return;
-      }
-      resolve({
-        ok: false,
-        timedOut,
-        reason: timedOut
-          ? `timeout_after_ms=${timeoutMs} exit_code=${code ?? "null"} signal=${signal ?? "null"}`
-          : `exit_code=${code ?? "null"} signal=${signal ?? "null"}`,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-      });
-    });
-  });
-}
-
-function bundledPythonSitePackages(bundledHome) {
-  if (!bundledHome || !fs.existsSync(bundledHome)) {
-    return [];
-  }
-  if (process.platform === "win32") {
-    const windowsSitePackages = path.join(bundledHome, "Lib", "site-packages");
-    return fs.existsSync(windowsSitePackages) ? [windowsSitePackages] : [];
-  }
-
-  const libRoot = path.join(bundledHome, "lib");
-  if (!fs.existsSync(libRoot)) {
-    return [];
-  }
-
-  const matches = [];
-  for (const entry of fs.readdirSync(libRoot)) {
-    if (!/^python\d+\.\d+$/.test(entry)) {
-      continue;
-    }
-    const sitePackages = path.join(libRoot, entry, "site-packages");
-    if (fs.existsSync(sitePackages)) {
-      matches.push(sitePackages);
-    }
-  }
-  return matches;
-}
-
-function bundledPythonLibDynload(bundledHome) {
-  if (!bundledHome || !fs.existsSync(bundledHome) || process.platform !== "darwin") {
-    return [];
-  }
-  const pythonHome = resolveBundledPythonHome(bundledHome);
-  const libRoot = pythonHome ? path.join(pythonHome, "lib") : "";
-  if (!libRoot || !fs.existsSync(libRoot)) {
-    return [];
-  }
-
-  const matches = [];
-  for (const entry of fs.readdirSync(libRoot)) {
-    if (!/^python\d+\.\d+$/.test(entry)) {
-      continue;
-    }
-    const libDynload = path.join(libRoot, entry, "lib-dynload");
-    if (fs.existsSync(libDynload)) {
-      matches.push(libDynload);
-    }
-  }
-  return matches;
-}
-
-function bundledPythonImportPaths(bundledHome) {
-  return [
-    ...bundledPythonSitePackages(bundledHome),
-    ...bundledPythonLibDynload(bundledHome),
-  ];
-}
-
-function resolveTypstBinary(backendRoot) {
-  const bundledCandidates = process.platform === "win32"
-    ? [path.join(backendRoot, "typst", "bin", "typst.exe")]
-    : [path.join(backendRoot, "typst", "bin", "typst")];
-  const candidates = app.isPackaged
-    ? bundledCandidates
-    : [
-        ...bundledCandidates,
-        "/usr/local/bin/typst",
-        "/opt/homebrew/bin/typst",
-      ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return "";
-}
-
 async function startBundledBackend() {
   updateSplashProgress(18, "正在检查运行文件", "正在校验后端、Python 和脚本资源");
   const backendRoot = resolveBackendRoot();
@@ -672,6 +146,15 @@ async function startBundledBackend() {
   const typstPackageCachePath = path.join(dataRoot, "typst-package-cache");
   const apiPort = 41000;
   const simplePort = 42000;
+  const aiServicePort = AI_SERVICE_PORT;
+  // packaged: backend/ai_service；开发未 prepare 时可回退仓库 backend/ai_service
+  let aiServiceRoot = path.join(backendRoot, "ai_service");
+  if (!fs.existsSync(path.join(aiServiceRoot, "retainpdf_ai", "__main__.py"))) {
+    const repoAi = path.join(appRoot, "..", "backend", "ai_service");
+    if (fs.existsSync(path.join(repoAi, "retainpdf_ai", "__main__.py"))) {
+      aiServiceRoot = repoAi;
+    }
+  }
 
   logDesktop(
     [
@@ -683,8 +166,9 @@ async function startBundledBackend() {
       `python=${pythonRuntime.command || "<missing>"}`,
       `pythonHome=${pythonRuntime.bundledHome || "<system>"}`,
       `scriptsDir=${scriptsDir}`,
+      `aiServiceRoot=${aiServiceRoot}`,
       `typst=${typstBin || "<missing>"}`,
-      `log=${desktopLogPath || resolveDesktopLogPath() || "<unavailable>"}`,
+      `log=${getDesktopLogPath() || "<unavailable>"}`,
     ].join(" "),
   );
 
@@ -701,78 +185,9 @@ async function startBundledBackend() {
     throw new Error(`missing bundled typst runtime under ${path.join(backendRoot, "typst")}`);
   }
 
-  if (process.platform === "darwin") {
-    const startupProbe = await probePythonRuntime(pythonRuntime, {
-      timeoutMs: app.isPackaged ? 10000 : 8000,
-      includeDependencyImports: false,
-    });
-    if (!startupProbe.ok && pythonRuntime.bundledHome) {
-      if (app.isPackaged) {
-        throw new Error(
-          [
-            `packaged macOS bundled python startup probe failed: ${startupProbe.reason}`,
-            startupProbe.stderr || startupProbe.stdout || "",
-          ].filter(Boolean).join("\n"),
-        );
-      }
-      console.warn(
-        `[desktop] bundled mac python startup probe failed, fallback to system python: ${startupProbe.reason}\n${startupProbe.stderr || ""}`.trim(),
-      );
-      updateSplashProgress(26, "正在检查 Python 运行时", "内置 Python 不可用，正在回退系统 Python");
-      const fallbackRuntime = { command: "python3", bundledHome: null };
-      const fallbackProbe = await probePythonRuntime(fallbackRuntime, {
-        timeoutMs: 10000,
-        includeDependencyImports: false,
-      });
-      if (fallbackProbe.ok) {
-        pythonRuntime = fallbackRuntime;
-      } else {
-        throw new Error(
-          `macOS Python runtime startup probe failed; bundled=${startupProbe.reason}; fallback=${fallbackProbe.reason}`,
-        );
-      }
-    }
-
-    const dependencyProbe = await probePythonRuntime(pythonRuntime, {
-      timeoutMs: app.isPackaged ? 30000 : 8000,
-      includeDependencyImports: true,
-    });
-    if (!dependencyProbe.ok) {
-      if (app.isPackaged && pythonRuntime.bundledHome && dependencyProbe.timedOut) {
-        console.warn(
-          [
-            `[desktop] packaged mac python dependency probe timed out; continuing to backend startup: ${dependencyProbe.reason}`,
-            dependencyProbe.stderr || dependencyProbe.stdout || "",
-          ].filter(Boolean).join("\n"),
-        );
-        updateSplashProgress(26, "正在检查 Python 运行时", "内置 Python 启动较慢，继续启动本地服务");
-      } else if (pythonRuntime.bundledHome && !app.isPackaged) {
-        console.warn(
-          `[desktop] bundled mac python dependency probe failed, fallback to system python: ${dependencyProbe.reason}\n${dependencyProbe.stderr || ""}`.trim(),
-        );
-        updateSplashProgress(26, "正在检查 Python 运行时", "内置 Python 不可用，正在回退系统 Python");
-        const fallbackRuntime = { command: "python3", bundledHome: null };
-        const fallbackProbe = await probePythonRuntime(fallbackRuntime, {
-          timeoutMs: 10000,
-          includeDependencyImports: true,
-        });
-        if (fallbackProbe.ok) {
-          pythonRuntime = fallbackRuntime;
-        } else {
-          throw new Error(
-            `macOS Python runtime import probe failed; bundled=${dependencyProbe.reason}; fallback=${fallbackProbe.reason}`,
-          );
-        }
-      } else {
-        throw new Error(
-          [
-            `packaged macOS bundled python probe failed: ${dependencyProbe.reason}`,
-            dependencyProbe.stderr || dependencyProbe.stdout || "",
-          ].filter(Boolean).join("\n"),
-        );
-      }
-    }
-  }
+  pythonRuntime = await preparePythonRuntime(pythonRuntime, {
+    updateSplashProgress,
+  });
   if (app.isPackaged && !pythonRuntime.bundledHome) {
     throw new Error(
       `missing bundled python runtime under ${path.join(backendRoot, "python")}`,
@@ -787,11 +202,49 @@ async function startBundledBackend() {
   const apiPortBusy = await canConnectToPort("127.0.0.1", apiPort);
   logDesktop(`[desktop] port ${apiPort} busy=${apiPortBusy}`);
   if (apiPortBusy) {
+    const allowExternalBackend = process.env.RETAINPDF_DESKTOP_ALLOW_EXTERNAL_BACKEND === "1";
+    if (app.isPackaged && !allowExternalBackend) {
+      throw new Error(
+        [
+          `端口 ${apiPort} 已被占用。`,
+          "正式桌面端不会复用已有后端，避免连接到旧版本或开发版后端导致渲染错误。",
+          "请关闭其他 RetainPDF、旧版桌面端、Docker/系统服务后再启动。",
+        ].join("\n"),
+      );
+    }
     if (await canReuseExistingBackend(apiPort)) {
       usingExternalBackend = true;
       logDesktop(`[desktop] reusing existing backend on port ${apiPort}`);
       updateSplashProgress(52, "检测到已有本地服务", "桌面端将直接复用当前后端");
       await waitForPort("127.0.0.1", apiPort, 5000);
+      // 仍尝试拉起 AI（若 41100 空闲）；复用的 Rust 会反代到本机 AI
+      const reuseEnv = buildBackendEnv({
+        apiPort,
+        aiServicePort,
+        aiServiceRoot,
+        backendRoot,
+        bundledFontPath,
+        bundledPythonHome: resolveBundledPythonHome(pythonRuntime.bundledHome),
+        bundledPythonImportPaths: bundledPythonImportPaths(pythonRuntime.bundledHome),
+        bundledTitleBoldFontPath,
+        bundledTypstFontDir,
+        dataRoot,
+        desktopApiKey: DESKTOP_API_KEY,
+        inheritHostPythonPath: !app.isPackaged,
+        pythonRuntime,
+        rustApiRoot,
+        scriptsDir,
+        simplePort,
+        typstBin,
+        typstPackageCachePath,
+        typstPackagePath,
+      });
+      await startRetainpdfAiService({
+        aiServicePort,
+        aiServiceRoot,
+        env: reuseEnv,
+        pythonCommand: pythonRuntime.command,
+      });
       updateSplashProgress(92, "本地服务已就绪", "正在加载主界面");
       return;
     }
@@ -806,49 +259,32 @@ async function startBundledBackend() {
     throw new Error(`端口 ${simplePort} 已被其他进程占用，请先释放后再启动桌面端。`);
   }
 
-  const env = {
-    ...process.env,
-    RUST_API_BIND_HOST: "127.0.0.1",
-    RUST_API_PORT: String(apiPort),
-    RUST_API_SIMPLE_PORT: String(simplePort),
-    RUST_API_KEYS: DESKTOP_API_KEY,
-    RUST_API_DATA_ROOT: dataRoot,
-    RUST_API_ROOT: rustApiRoot,
-    RUST_API_NORMAL_MAX_BYTES: String(200 * 1024 * 1024),
-    RUST_API_NORMAL_MAX_PAGES: "300",
-    RUST_API_PROJECT_ROOT: backendRoot,
-    RUST_API_SCRIPTS_DIR: scriptsDir,
-    PYTHON_BIN: pythonRuntime.command,
-    PYTHONPATH: [
-      scriptsDir,
-      ...bundledPythonImportPaths(pythonRuntime.bundledHome),
-      process.env.PYTHONPATH || "",
-    ].filter(Boolean).join(path.delimiter),
-    PYTHONUNBUFFERED: "1",
-    PYTHONUTF8: "1",
-    PYTHONDONTWRITEBYTECODE: "1",
-    PDF_TRANSLATOR_TRUST_ENV_PROXY: "1",
-    RETAIN_PDF_FONT_PATH: bundledFontPath,
-    RETAIN_PDF_TITLE_BOLD_FONT_PATH: bundledTitleBoldFontPath,
-    RETAIN_PDF_TYPST_FONT_DIRS: bundledTypstFontDir,
-    RETAIN_PDF_TYPST_FONT_FAMILY: "Source Han Serif SC",
-    TYPST_PACKAGE_CACHE_PATH: typstPackageCachePath,
-  };
-  if (fs.existsSync(typstPackagePath)) {
-    env.TYPST_PACKAGE_PATH = typstPackagePath;
-  }
   const bundledPythonHome = resolveBundledPythonHome(pythonRuntime.bundledHome);
-  if (bundledPythonHome) {
-    env.PYTHONHOME = bundledPythonHome;
-  } else {
-    delete env.PYTHONHOME;
-  }
-  if (fs.existsSync(typstBin)) {
-    env.TYPST_BIN = typstBin;
-  }
+  const env = buildBackendEnv({
+    apiPort,
+    aiServicePort,
+    aiServiceRoot,
+    backendRoot,
+    bundledFontPath,
+    bundledPythonHome,
+    bundledPythonImportPaths: bundledPythonImportPaths(pythonRuntime.bundledHome),
+    bundledTitleBoldFontPath,
+    bundledTypstFontDir,
+    dataRoot,
+    desktopApiKey: DESKTOP_API_KEY,
+    inheritHostPythonPath: !app.isPackaged,
+    pythonRuntime,
+    rustApiRoot,
+    scriptsDir,
+    simplePort,
+    typstBin,
+    typstPackageCachePath,
+    typstPackagePath,
+  });
 
-  updateSplashProgress(52, "正在启动本地服务", "Rust API 与 Python worker 正在启动");
+  updateSplashProgress(52, "正在启动本地服务", "Rust API 与 AI 服务正在启动");
   logDesktop(`[desktop] spawning backend: ${backendBin}`);
+  backendStartupDiagnostics.reset(backendBin, backendRoot);
   backendChild = spawn(backendBin, [], {
     cwd: backendRoot,
     env,
@@ -857,11 +293,13 @@ async function startBundledBackend() {
   });
 
   backendChild.stdout.on("data", (chunk) => {
+    backendStartupDiagnostics.rememberOutput("stdout", chunk);
     const message = `[rust_api] ${chunk}`;
     process.stdout.write(message);
     appendDesktopLog(message.trimEnd());
   });
   backendChild.stderr.on("data", (chunk) => {
+    backendStartupDiagnostics.rememberOutput("stderr", chunk);
     const message = `[rust_api] ${chunk}`;
     process.stderr.write(message);
     appendDesktopLog(message.trimEnd());
@@ -873,8 +311,17 @@ async function startBundledBackend() {
       return;
     }
     const detail = `code=${code ?? "null"} signal=${signal ?? "null"}`;
+    backendStartupDiagnostics.markExit(detail);
     logDesktopError(`[desktop] Rust API worker crashed: ${detail}`);
     dialog.showErrorBox("Rust API worker crashed", detail);
+  });
+
+  // retainpdf-ai：与 Rust 同生命周期；LLM key 由前端按请求传入
+  await startRetainpdfAiService({
+    aiServicePort,
+    aiServiceRoot,
+    env,
+    pythonCommand: pythonRuntime.command,
   });
 
   let waitingProgress = 58;
@@ -886,106 +333,84 @@ async function startBundledBackend() {
       "首次启动可能稍慢，请稍候",
     );
   }, 500);
-  const backendReadyTimeoutMs = process.platform === "darwin" && app.isPackaged ? 60000 : 30000;
+  const backendReadyTimeoutMs = app.isPackaged ? 90000 : 30000;
   logDesktop(`[desktop] waiting for backend port ${apiPort} timeoutMs=${backendReadyTimeoutMs}`);
-  await waitForPort("127.0.0.1", apiPort, backendReadyTimeoutMs);
+  await backendStartupDiagnostics.waitForBackendReady("127.0.0.1", apiPort, backendReadyTimeoutMs);
   clearInterval(waitingTimer);
   logDesktop(`[desktop] backend ready on port ${apiPort}`);
   updateSplashProgress(92, "本地服务已就绪", "正在加载主界面");
 }
 
-function createWindow() {
-  const frontendRoot = resolveFrontendRoot();
-  logDesktop(`[desktop] creating main window frontendRoot=${frontendRoot}`);
+async function startRetainpdfAiService({
+  aiServicePort,
+  aiServiceRoot,
+  env,
+  pythonCommand,
+}) {
+  if (!fs.existsSync(path.join(aiServiceRoot, "retainpdf_ai", "__main__.py"))) {
+    logDesktopError(`[desktop] retainpdf-ai package missing under ${aiServiceRoot}; AI ask will return 502`);
+    return;
+  }
 
-  mainWindow = new BrowserWindow({
-    width: 1480,
-    height: 960,
-    minWidth: 1200,
-    minHeight: 760,
-    autoHideMenuBar: true,
-    show: false,
-    icon: resolveWindowIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-    },
+  const aiBusy = await canConnectToPort("127.0.0.1", aiServicePort);
+  if (aiBusy) {
+    logDesktop(`[desktop] AI service port ${aiServicePort} already in use; reusing`);
+    return;
+  }
+
+  logDesktop(`[desktop] spawning retainpdf-ai: ${pythonCommand} -m retainpdf_ai (port ${aiServicePort})`);
+  aiServiceChild = spawn(pythonCommand, ["-m", "retainpdf_ai"], {
+    cwd: aiServiceRoot,
+    env,
+    windowsHide: process.platform === "win32",
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const indexPath = path.join(frontendRoot, "index.html");
-  logDesktop(`[desktop] loading frontend index=${indexPath}`);
-  mainWindow.loadFile(indexPath);
-
-  mainWindow.on("close", (event) => {
-    if (isQuitting) {
+  aiServiceChild.stdout.on("data", (chunk) => {
+    const message = `[retainpdf_ai] ${chunk}`;
+    process.stdout.write(message);
+    appendDesktopLog(message.trimEnd());
+  });
+  aiServiceChild.stderr.on("data", (chunk) => {
+    const message = `[retainpdf_ai] ${chunk}`;
+    process.stderr.write(message);
+    appendDesktopLog(message.trimEnd());
+  });
+  aiServiceChild.once("exit", (code, signal) => {
+    aiServiceChild = null;
+    if (backendStopping || isQuitting) {
       return;
     }
-    event.preventDefault();
-    hideMainWindowToTray();
+    logDesktopError(
+      `[desktop] retainpdf-ai exited unexpectedly: code=${code ?? "null"} signal=${signal ?? "null"}`,
+    );
   });
 
-  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    logDesktop(`[desktop][renderer][level=${level}] ${sourceId || "unknown"}:${line || 0} ${message || ""}`);
-  });
-
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
-    const detail = `code=${errorCode} url=${validatedURL || "unknown"} error=${errorDescription || "unknown"}`;
-    logDesktopError(`[desktop] renderer load failed: ${detail}`);
-    dialog.showErrorBox("RetainPDF 页面加载失败", detail);
-  });
-
-  mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    const detail = `reason=${details?.reason || "unknown"} exitCode=${details?.exitCode ?? "unknown"}`;
-    logDesktopError(`[desktop] renderer process gone: ${detail}`);
-    dialog.showErrorBox("RetainPDF 渲染进程异常退出", detail);
-  });
-
-  mainWindow.webContents.once("did-finish-load", () => {
-    logDesktop("[desktop] frontend loaded; showing main window");
-    updateSplashProgress(100, "准备完成", "正在进入主界面");
-    mainWindow.show();
-    if (splashWindow && !splashWindow.isDestroyed()) {
-      splashWindow.close();
-      splashWindow = null;
-    }
-  });
-
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
-    return { action: "deny" };
-  });
-}
-
-function resolveFrontendRoot() {
-  const generatedFrontendRoot = path.join(__dirname, "app", "frontend");
-  if (app.isPackaged) {
-    return generatedFrontendRoot;
+  const aiReadyTimeoutMs = app.isPackaged ? 60000 : 20000;
+  try {
+    await waitForPort("127.0.0.1", aiServicePort, aiReadyTimeoutMs);
+    logDesktop(`[desktop] retainpdf-ai ready on port ${aiServicePort}`);
+  } catch (error) {
+    // 不阻断主程序：翻译流水线仍可用，仅 AI 问答会 502
+    logDesktopError(
+      `[desktop] retainpdf-ai failed to become ready: ${error && error.message ? error.message : error}`,
+    );
   }
-  if (fs.existsSync(path.join(generatedFrontendRoot, "index.html"))) {
-    return generatedFrontendRoot;
-  }
-  const sourceFrontendRoot = path.resolve(__dirname, "..", "frontend");
-  if (fs.existsSync(path.join(sourceFrontendRoot, "index.html"))) {
-    return sourceFrontendRoot;
-  }
-  return generatedFrontendRoot;
 }
 
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
-    desktopLogPath = resolveDesktopLogPath();
+    setDesktopLogPath(resolveDesktopLogPath());
     appendDesktopLog("========== RetainPDF desktop startup ==========");
     logDesktop(`[desktop] app ready version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")}`);
-    closeToTrayHintShown = loadDesktopConfig().closeToTrayHintShown;
+    setCloseToTrayHintShown(loadDesktopConfig().closeToTrayHintShown);
     createSplashWindow()
       .then(() => startBundledBackend())
       .then(() => {
         createTray();
         createWindow();
         app.on("activate", () => {
-          if (!mainWindow || mainWindow.isDestroyed()) {
+          if (!hasLiveMainWindow()) {
             createWindow();
             return;
           }
@@ -995,7 +420,12 @@ if (gotSingleInstanceLock) {
       .catch((error) => {
         const detail = String(error && error.stack ? error.stack : error && error.message ? error.message : error);
         logDesktopError(`[desktop] startup failed: ${detail}`);
-        dialog.showErrorBox("RetainPDF startup failed", detail);
+        const desktopLogPath = getDesktopLogPath();
+        const dialogDetail = [
+          String(error && error.message ? error.message : error),
+          desktopLogPath ? `\n完整日志: ${desktopLogPath}` : "",
+        ].filter(Boolean).join("\n");
+        dialog.showErrorBox("RetainPDF startup failed", dialogDetail);
         app.quit();
       });
   });
@@ -1009,8 +439,16 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  backendStopping = true;
+  if (aiServiceChild && !aiServiceChild.killed) {
+    try {
+      aiServiceChild.kill();
+    } catch (_err) {
+      /* ignore */
+    }
+    aiServiceChild = null;
+  }
   if (!usingExternalBackend && backendChild && !backendChild.killed) {
-    backendStopping = true;
     backendChild.kill();
   }
 });
@@ -1019,23 +457,11 @@ ipcMain.handle("desktop:invoke", async (_event, command, args = {}) => {
   switch (command) {
     case "load_desktop_config": {
       const config = loadDesktopConfig();
-      return {
-        firstRunCompleted: config.firstRunCompleted,
-        closeToTrayHintShown: config.closeToTrayHintShown,
-        browserConfig: buildBrowserConfig(config),
-        developerConfig: config.developerConfig || {},
-        runtimeConfig: buildDesktopRuntimeConfig(config),
-      };
+      return buildDesktopConfigResponse(config);
     }
     case "save_desktop_config": {
       const config = saveDesktopConfig(args?.payload || {});
-      return {
-        firstRunCompleted: config.firstRunCompleted,
-        closeToTrayHintShown: config.closeToTrayHintShown,
-        browserConfig: buildBrowserConfig(config),
-        developerConfig: config.developerConfig || {},
-        runtimeConfig: buildDesktopRuntimeConfig(config),
-      };
+      return buildDesktopConfigResponse(config);
     }
     case "open_output_directory": {
       const outputDir = path.join(app.getPath("userData"), "data", "jobs");

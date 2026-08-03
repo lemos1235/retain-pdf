@@ -115,10 +115,24 @@ class TranslationRunDiagnostics:
     _adaptive_success_streak: int = field(default=0, init=False, repr=False)
     _adaptive_recent_failure_count: int = field(default=0, init=False, repr=False)
     _adaptive_slow_success_streak: int = field(default=0, init=False, repr=False)
+    _warmup_pending: bool = field(default=False, init=False, repr=False)
+    _warmup_restore_limit: int = field(default=0, init=False, repr=False)
     _result_stats: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _queue_split: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _flush_stats: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _tail_retry_stats: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _token_usage: dict[str, int] = field(
+        default_factory=lambda: {
+            "requests_with_usage": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+        },
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         initial_limit = max(1, int(self.configured_workers))
@@ -231,11 +245,22 @@ class TranslationRunDiagnostics:
             self._effective["http_pool_size"] = int(max(1, pool_size))
             self._effective["http_pool_cap"] = int(max(1, pool_cap))
 
-    def configure_adaptive_concurrency(self, *, initial_limit: int, floor_limit: int | None = None) -> None:
+    def configure_adaptive_concurrency(
+        self,
+        *,
+        initial_limit: int,
+        floor_limit: int | None = None,
+        warmup: bool = False,
+    ) -> None:
         limit = max(1, min(max(1, self.configured_workers), int(initial_limit or 1)))
         floor = max(1, min(limit, int(floor_limit if floor_limit is not None else min(8, limit))))
         with self._adaptive_condition:
-            self._adaptive_limit = limit
+            # warmup:先只放行 1 条请求,让 provider 的前缀缓存写入公共
+            # 系统提示词,首条请求结束后恢复全并发——后续请求命中缓存,
+            # 同时避免全并发冷启动惊群。
+            self._warmup_pending = bool(warmup) and limit > 1
+            self._warmup_restore_limit = limit
+            self._adaptive_limit = 1 if self._warmup_pending else limit
             self._adaptive_initial_limit = limit
             self._adaptive_peak_limit = max(self._adaptive_peak_limit, limit)
             self._adaptive_floor_limit = floor
@@ -317,6 +342,11 @@ class TranslationRunDiagnostics:
     ) -> None:
         with self._adaptive_condition:
             self._adaptive_inflight = max(0, self._adaptive_inflight - 1)
+            if self._warmup_pending:
+                # 无论首条请求成败都恢复全并发:预热是尽力而为,失败时
+                # 不能把整个运行钉死在串行。
+                self._warmup_pending = False
+                self._adaptive_limit = max(self._adaptive_limit, self._warmup_restore_limit)
             self._rebalance_adaptive_limit(
                 success=success,
                 elapsed_ms=elapsed_ms,
@@ -347,16 +377,18 @@ class TranslationRunDiagnostics:
             self._adaptive_slow_success_streak = 0
             return
         if not success and timeout_like:
-            if high_capacity_provider:
-                self._adaptive_recent_failure_count += 1
-                self._adaptive_success_streak = 0
-                self._adaptive_slow_success_streak = 0
-                return
             self._adaptive_recent_failure_count += 1
-            reduced = max(min_limit, int(math.floor(self._adaptive_limit * 0.5)))
-            self._adaptive_limit = reduced
             self._adaptive_success_streak = 0
             self._adaptive_slow_success_streak = 0
+            if high_capacity_provider:
+                # 孤立超时容忍不降速;但失败连续堆积说明网络/provider 边缘
+                # 正在劣化(实测连接超时风暴中 limit 钉死 100 只会加剧惊群),
+                # 每堆积 5 次温和降速一档。成功会清零计数。
+                if self._adaptive_recent_failure_count % 5 == 0:
+                    self._adaptive_limit = max(min_limit, int(math.floor(self._adaptive_limit * 0.85)))
+                return
+            reduced = max(min_limit, int(math.floor(self._adaptive_limit * 0.5)))
+            self._adaptive_limit = reduced
             return
         if high_capacity_provider and success:
             self._adaptive_recent_failure_count = 0
@@ -436,6 +468,25 @@ class TranslationRunDiagnostics:
                 slow_sample["error_class"] = error_class
             self._remember_slow_request(slow_sample)
 
+    def record_token_usage(self, usage: dict[str, Any]) -> None:
+        # Accumulates the provider-reported `usage` block (OpenAI-compatible),
+        # including DeepSeek's prompt cache hit/miss split, so runs can be
+        # costed and cache effectiveness verified from the run summary.
+        if not isinstance(usage, dict):
+            return
+        with self._lock:
+            self._token_usage["requests_with_usage"] += 1
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+            ):
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    self._token_usage[key] += int(value)
+
     def _remember_slow_request(self, sample: dict[str, Any], limit: int = 12) -> None:
         self._slow_requests.append(sample)
         self._slow_requests.sort(key=lambda item: int(item.get("elapsed_ms", 0)), reverse=True)
@@ -511,6 +562,7 @@ class TranslationRunDiagnostics:
                 "result_apply": dict(self._result_stats),
                 "result_flush": dict(self._flush_stats),
                 "tail_retry": dict(self._tail_retry_stats),
+                "token_usage": dict(self._token_usage),
                 "phase_elapsed_ms": self._phase_elapsed_summary(),
                 "slow_request_samples": list(self._slow_requests),
                 "recommendations": self._recommendations(),

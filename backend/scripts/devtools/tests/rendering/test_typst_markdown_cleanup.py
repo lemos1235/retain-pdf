@@ -90,6 +90,87 @@ def test_direct_typst_keeps_short_latex_text_tags_inside_math() -> None:
     assert r"n_{$ hc $}" not in markdown
 
 
+def test_direct_typst_renders_hbar_as_unicode_symbol_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"振动常数 $ \omega_e = \hbar \sqrt{k / \mu} $ 等间距分布。"
+    )
+
+    assert "ℏ" in markdown
+    assert r"\hbar" not in markdown
+    assert " hbar " not in markdown
+
+
+def test_direct_typst_renders_partial_as_unicode_symbol_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"曲率 $ k=\left(\frac{\partial^{2}U}{\partial R^{2}}\right) $。"
+    )
+
+    assert "∂" in markdown
+    assert r"\partial" not in markdown
+
+
+def test_direct_typst_renders_otimes_as_unicode_symbol_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"选择规则 $ \Gamma_i \otimes \Gamma_f \ni \Gamma_\mu $。"
+    )
+
+    assert "⊗" in markdown
+    assert r"\otimes" not in markdown
+
+
+def test_direct_typst_normalizes_left_right_angle_ket_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"将单激发行列式与 $ \left|\Psi_0\right\rangle $ 混合。"
+    )
+
+    assert r"\left" not in markdown
+    assert r"\right" not in markdown
+    assert r"$|\Psi_0⟩$" in markdown
+
+
+def test_direct_typst_normalizes_left_right_bra_matrix_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"非对角元满足 $ \left\langle\chi_i\right|f|\chi_j\rangle=0 $。"
+    )
+
+    assert r"\left" not in markdown
+    assert r"\right" not in markdown
+    assert r"$⟨\chi_i|f|\chi_j⟩=0$" in markdown
+
+
+def test_direct_typst_normalizes_nested_left_right_matrix_element_for_mitex() -> None:
+    markdown = build_direct_typst_passthrough_text(
+        r"矩阵元 $ \left\langle\Psi_a^{rs}\right|\mathcal{H}\left|\Psi_{ab}^{rs}\right\rangle $。"
+    )
+
+    assert r"\left" not in markdown
+    assert r"\right" not in markdown
+    assert r"$⟨\Psi_a^{rs}|\mathcal{H}|\Psi_{ab}^{rs}⟩$" in markdown
+
+
+def test_direct_typst_does_not_inject_empty_base_for_prefix_scripts() -> None:
+    """Prefix-script empty bases are translation's job, not render-time regex."""
+    markdown = build_direct_typst_passthrough_text(
+        r"能量为 $ ^{N}E_0 = \langle ^{N}\Psi_0 | \mathcal{H} | ^{N}\Psi_0 \rangle $。"
+    )
+
+    assert r"\{}^{" not in markdown
+    assert "⟨" in markdown and "⟩" in markdown
+    assert r"^{N}\Psi_0" in markdown
+
+
+def test_direct_typst_preserves_backslash_space_before_degree_mathrm() -> None:
+    r"""LaTeX backslash-space before ^{\circ} must not become \{}^{\circ}."""
+    markdown = build_direct_typst_passthrough_text(
+        r"反应在 $-78\ ^{\circ}\mathrm{C}$ 至室温下进行。"
+    )
+
+    assert r"-78\{}^{\circ}" not in markdown
+    assert r"\{}^{" not in markdown
+    assert r"^{\circ}\mathrm{C}" in markdown
+    assert r"\ ^{\circ}\mathrm{C}" in markdown
+
+
 def test_body_rendering_folds_model_visual_line_breaks_for_flow_text() -> None:
     item = {
         "item_id": "p005-b025",
@@ -104,5 +185,3 @@ def test_body_rendering_folds_model_visual_line_breaks_for_flow_text() -> None:
     assert "\n" not in rendered
     assert rendered == "对于较大的 $ CN_{A}^{\\prime} $ 值，该 d 能级能量降低。"
     assert "_render_preserve_line_breaks" not in item
-
-

@@ -185,10 +185,22 @@ test("job source pdf fallback is encoded and absolute", () => {
   const action = jobActions.resolveJobSourcePdfAction({
     job_id: "job 1/2",
   });
-  assert.equal(action.ready, true);
+  assert.equal(action.ready, false);
   assert.equal(
     action.url,
     "http://retainpdf.local:41000/api/v1/jobs/job%201%2F2/artifacts/source_pdf",
+  );
+});
+
+test("job source pdf action becomes ready only from explicit readiness signals", () => {
+  const action = jobActions.resolveJobSourcePdfAction({
+    job_id: "job-ready",
+    source_pdf_ready: true,
+  });
+  assert.equal(action.ready, true);
+  assert.equal(
+    action.url,
+    "http://retainpdf.local:41000/api/v1/jobs/job-ready/artifacts/source_pdf",
   );
 });
 
@@ -200,6 +212,14 @@ test("markdown asset resolver keeps special URLs and resolves relative images", 
   assert.equal(
     artifacts.resolveMarkdownAssetUrl("http://retainpdf.local/images/", "/api/v1/jobs/1/markdown/images/p.png"),
     "http://retainpdf.local:41000/api/v1/jobs/1/markdown/images/p.png",
+  );
+  // path 常带 images/ 前缀，base 已是 .../markdown/images/ —— 不得拼成双 images/
+  assert.equal(
+    artifacts.resolveMarkdownAssetUrl(
+      "http://127.0.0.1:41000/api/v1/jobs/j1/markdown/images/",
+      "images/page-1/imgs/chart.png",
+    ),
+    "http://127.0.0.1:41000/api/v1/jobs/j1/markdown/images/page-1/imgs/chart.png",
   );
   assert.equal(artifacts.resolveMarkdownAssetUrl("", "data:image/png;base64,abc"), "data:image/png;base64,abc");
   assert.equal(artifacts.resolveMarkdownAssetUrl("", "blob:abc"), "blob:abc");
